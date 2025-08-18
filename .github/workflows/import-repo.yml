@@ -1,39 +1,63 @@
-name: Import Repository
+name: Clone From Source
 
 on:
-  workflow_dispatch:
-    inputs:
-      sourceURL:
-        description: "Source repository Git URL"
-        required: true
-      repoName:
-        description: "New repository name"
-        required: true
+  repository_dispatch:
+    types: [clone-repo]
+
+permissions:
+  contents: write
+
+env:
+  GH_TOKEN: ${{ secrets.GH_TOKEN }}
+  OWNER: ${{ github.event.client_payload.owner }}
+  REPO_NAME: ${{ github.event.client_payload.repoName }}
+  SOURCE_URL: ${{ github.event.client_payload.sourceURL }}
 
 jobs:
-  import:
+  mirror:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout empty repo
-        uses: actions/checkout@v4
-
-      - name: Create new GitHub repo
-        id: create_repo
+      - name: Validate inputs
         run: |
-          curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-               -H "Accept: application/vnd.github+json" \
-               https://api.github.com/user/repos \
-               -d "{\"name\": \"${{ github.event.inputs.repoName }}\", \"private\": false}" \
-               > response.json
+          if [ -z "${REPO_NAME}" ] || [ -z "${SOURCE_URL}" ] || [ -z "${OWNER}" ]; then
+            echo "Missing one or more required inputs: REPO_NAME, SOURCE_URL, OWNER"
+            exit 1
+          fi
+          echo "Owner: ${OWNER}"
+          echo "Target repo: ${REPO_NAME}"
+          echo "Source: ${SOURCE_URL}"
 
-          echo "Repo URL: $(jq -r '.html_url' response.json)"
-          echo "repo_url=$(jq -r '.html_url' response.json)" >> $GITHUB_OUTPUT
-
-      - name: Clone source and push mirror
+      - name: Ensure target repo exists (create if missing)
+        env:
+          API: https://api.github.com
         run: |
-          git clone --bare "${{ github.event.inputs.sourceURL }}" source-repo
-          cd source-repo
-          git push --mirror "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository_owner }}/${{ github.event.inputs.repoName }}.git"
+          set -e
+          set -o pipefail
+          # Check if repo exists
+          code=$(curl -s -o /dev/null -w "%{http_code}"             -H "Authorization: Bearer ${GH_TOKEN}"             -H "Accept: application/vnd.github+json"             "${API}/repos/${OWNER}/${REPO_NAME}")
+          if [ "$code" = "200" ]; then
+            echo "Repo already exists: ${OWNER}/${REPO_NAME}"
+          else
+            echo "Creating repo ${OWNER}/${REPO_NAME} (public)"
+            create_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST               -H "Authorization: Bearer ${GH_TOKEN}"               -H "Accept: application/vnd.github+json"               "${API}/user/repos"               -d "{"name":"${REPO_NAME}","private":false}")
+            if [ "$create_code" != "201" ]; then
+              echo "Failed to create repo; HTTP ${create_code}"
+              exit 1
+            fi
+            echo "Created."
+          fi
 
-      - name: Done
-        run: echo "✅ Imported ${{ github.event.inputs.sourceURL }} into ${{ steps.create_repo.outputs.repo_url }}"
+      - name: Mirror from source to target
+        run: |
+          set -e
+          set -o pipefail
+          workdir=$(mktemp -d)
+          git config --global user.email "actions@users.noreply.github.com"
+          git config --global user.name "Repo Cloner Action"
+          cd "$workdir"
+          echo "Cloning source (bare): ${SOURCE_URL}"
+          git clone --bare "${SOURCE_URL}" src.git
+          cd src.git
+          echo "Pushing mirror to target: ${OWNER}/${REPO_NAME}"
+          git remote add target "https://${GH_TOKEN}@github.com/${OWNER}/${REPO_NAME}.git"
+          git push --mirror target
